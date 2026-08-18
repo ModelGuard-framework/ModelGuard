@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn==1.5.2
+joblib
+pytest
+streamlit
+deepchecks
+selenium
+python-docx
