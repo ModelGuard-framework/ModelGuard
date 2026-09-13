@@ -1,49 +1,29 @@
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
+
+from core.config import dataset_path, label_column, model_path
+from core.validator import (
+    check_preprocessing,
+    find_label_column,
+    get_feature_columns,
+    load_dataset,
+    load_model,
+)
 
 
-DATASET_PATH = "dataset/test_dataset.csv"
+def get_model_input():
+    model = load_model(model_path())
+    df = load_dataset(dataset_path())
+    label = find_label_column(df, label_column())
+    features = get_feature_columns(model, df, label)
+    return model, df[features]
 
 
-def test_preprocessing_preserves_rows():
-    df = pd.read_csv(DATASET_PATH)
-
-    X = df.drop("label", axis=1)
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    assert X_scaled.shape[0] == X.shape[0]
+def test_preprocessing_accepts_model_input():
+    model, X = get_model_input()
+    result = check_preprocessing(model, X)
+    assert result["status"] == "PASS", result["details"]
 
 
-def test_preprocessing_preserves_features():
-    df = pd.read_csv(DATASET_PATH)
-
-    X = df.drop("label", axis=1)
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    assert X_scaled.shape[1] == X.shape[1]
-
-
-def test_preprocessing_produces_numeric_values():
-    df = pd.read_csv(DATASET_PATH)
-
-    X = df.drop("label", axis=1)
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    assert X_scaled.dtype.kind in "fc"
-
-
-def test_preprocessing_has_no_missing_values():
-    df = pd.read_csv(DATASET_PATH)
-
-    X = df.drop("label", axis=1)
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    assert not pd.isnull(X_scaled).any()
+def test_preprocessing_preserves_row_count():
+    model, X = get_model_input()
+    predictions = model.predict(X)
+    assert len(predictions) == len(X)

@@ -1,22 +1,24 @@
-import os
 
+from core.config import dataset_path, label_column, model_path, report_path
+from core.validator import run_validation_pipeline
 from reports.report_generator import generate_report
 
 
 def test_report_generation():
-    results = {
-        "Model Integrity": "PASS",
-        "Dataset Input": "PASS",
-        "Data Validation": "PASS",
-        "Preprocessing": "PASS",
-        "Model Inference": "PASS",
-        "Result Validation": "PASS",
-        "Robustness Testing": "PASS",
-        "Data Integrity": "PASS"
-    }
+    results = run_validation_pipeline(
+        model_path(),
+        dataset_path(),
+        label_column(),
+    )
 
-    output_path = "reports/test_report.docx"
+    output_path = report_path()
+    generate_report(
+        results,
+        output_path,
+        model_path=model_path(),
+        dataset_path=dataset_path(),
+        label_column=label_column(),
+    )
 
-    generate_report(results, output_path)
-
-    assert os.path.exists(output_path)
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0

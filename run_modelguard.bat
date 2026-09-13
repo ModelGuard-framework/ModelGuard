@@ -1,0 +1,1 @@
+@echo off\nsetlocal\n\nREM ModelGuard local/offline runner. No virtual-environment activation is required.\nREM Use Python 3.11 if it is installed.\n\npy -3.11 -m streamlit run app.py\nif errorlevel 1 (\n  echo.\n  echo ModelGuard could not start. Check that Python 3.11 and the required packages are installed.\n  pause\n)\n
