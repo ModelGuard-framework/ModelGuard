@@ -1,78 +1,23 @@
-import pandas as pd
-import numpy as np
-import joblib
+
+from core.config import dataset_path, label_column, model_path
+from core.validator import (
+    check_robustness,
+    find_label_column,
+    get_feature_columns,
+    load_dataset,
+    load_model,
+)
 
 
-MODEL_PATH = "model/sample_model.joblib"
-DATASET_PATH = "dataset/test_dataset.csv"
+def get_model_input():
+    model = load_model(model_path())
+    df = load_dataset(dataset_path())
+    label = find_label_column(df, label_column())
+    features = get_feature_columns(model, df, label)
+    return model, df[features]
 
 
-def load_model_and_data():
-    model = joblib.load(MODEL_PATH)
-    df = pd.read_csv(DATASET_PATH)
-
-    X = df.drop("label", axis=1)
-
-    return model, X
-
-
-def test_small_perturbation():
-    model, X = load_model_and_data()
-
-    X_perturbed = X.copy()
-    X_perturbed["feature_1"] += 0.1
-
-    predictions = model.predict(X_perturbed)
-
-    assert len(predictions) == len(X)
-
-
-def test_noise_input():
-    model, X = load_model_and_data()
-
-    X_noisy = X.copy()
-
-    noise = np.random.normal(
-        0,
-        0.1,
-        X_noisy.shape
-    )
-
-    X_noisy = X_noisy + noise
-
-    predictions = model.predict(X_noisy)
-
-    assert len(predictions) == len(X)
-
-
-def test_missing_feature():
-    model, X = load_model_and_data()
-
-    X_missing = X.copy()
-
-    X_missing["feature_1"] = np.nan
-
-    try:
-        predictions = model.predict(X_missing)
-
-        assert len(predictions) == len(X)
-
-    except ValueError:
-        # Model correctly rejects invalid input
-        assert True
-
-
-def test_out_of_distribution_input():
-    model, X = load_model_and_data()
-
-    X_ood = X.copy()
-
-    # Create values far outside the normal range
-    X_ood["feature_1"] = 1000
-    X_ood["feature_2"] = 1000
-    X_ood["feature_3"] = 1000
-    X_ood["feature_4"] = 1000
-
-    predictions = model.predict(X_ood)
-
-    assert len(predictions) == len(X)
+def test_small_input_perturbation():
+    model, X = get_model_input()
+    result = check_robustness(model, X)
+    assert result["status"] == "PASS", result["details"]

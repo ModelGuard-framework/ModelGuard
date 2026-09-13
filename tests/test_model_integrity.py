@@ -1,19 +1,18 @@
-import os
-import joblib
 
-
-MODEL_PATH = "model/sample_model.joblib"
+from core.config import model_path
+from core.validator import check_model_integrity
 
 
 def test_model_file_exists():
-    assert os.path.exists(MODEL_PATH)
+    result = check_model_integrity(model_path())
+    assert result["status"] != "FAIL", result["details"]
 
 
 def test_model_can_be_loaded():
-    model = joblib.load(MODEL_PATH)
-    assert model is not None
+    result = check_model_integrity(model_path())
+    assert result["status"] == "PASS", result["details"]
 
 
 def test_model_has_prediction_method():
-    model = joblib.load(MODEL_PATH)
-    assert hasattr(model, "predict")
+    result = check_model_integrity(model_path())
+    assert result["status"] == "PASS", result["details"]

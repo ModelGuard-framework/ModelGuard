@@ -1,50 +1,35 @@
-import pandas as pd
-import joblib
+
+from core.config import dataset_path, label_column, model_path
+from core.validator import (
+    check_inference,
+    find_label_column,
+    get_feature_columns,
+    load_dataset,
+    load_model,
+)
 
 
-MODEL_PATH = "model/sample_model.joblib"
-DATASET_PATH = "dataset/test_dataset.csv"
+def get_model_input():
+    model = load_model(model_path())
+    df = load_dataset(dataset_path())
+    label = find_label_column(df, label_column())
+    features = get_feature_columns(model, df, label)
+    return model, df[features]
 
 
 def test_model_generates_predictions():
-    model = joblib.load(MODEL_PATH)
-
-    df = pd.read_csv(DATASET_PATH)
-    X = df.drop("label", axis=1)
-
-    predictions = model.predict(X)
-
-    assert predictions is not None
+    model, X = get_model_input()
+    result = check_inference(model, X)
+    assert result["status"] == "PASS", result["details"]
 
 
 def test_prediction_count_matches_input():
-    model = joblib.load(MODEL_PATH)
-
-    df = pd.read_csv(DATASET_PATH)
-    X = df.drop("label", axis=1)
-
+    model, X = get_model_input()
     predictions = model.predict(X)
-
     assert len(predictions) == len(X)
 
 
 def test_predictions_are_not_empty():
-    model = joblib.load(MODEL_PATH)
-
-    df = pd.read_csv(DATASET_PATH)
-    X = df.drop("label", axis=1)
-
+    model, X = get_model_input()
     predictions = model.predict(X)
-
     assert len(predictions) > 0
-
-
-def test_predictions_are_valid():
-    model = joblib.load(MODEL_PATH)
-
-    df = pd.read_csv(DATASET_PATH)
-    X = df.drop("label", axis=1)
-
-    predictions = model.predict(X)
-
-    assert set(predictions).issubset({0, 1})

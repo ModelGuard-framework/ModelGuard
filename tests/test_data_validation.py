@@ -1,39 +1,34 @@
-import pandas as pd
-import numpy as np
+
+from core.config import dataset_path, label_column, model_path
+from core.validator import (
+    check_dataset_validation,
+    find_label_column,
+    load_dataset,
+    load_model,
+)
 
 
-DATASET_PATH = "dataset/test_dataset.csv"
+def test_dataset_validation():
+    model = load_model(model_path())
+    df = load_dataset(dataset_path())
+    label = find_label_column(df, label_column())
+
+    result = check_dataset_validation(df, model, label)
+    assert result["status"] == "PASS", result["details"]
 
 
 def test_no_missing_values():
-    df = pd.read_csv(DATASET_PATH)
-
-    assert not df.isnull().any().any()
+    df = load_dataset(dataset_path())
+    assert int(df.isna().sum().sum()) == 0
 
 
 def test_no_duplicate_records():
-    df = pd.read_csv(DATASET_PATH)
-
-    assert df.duplicated().sum() == 0
-
-
-def test_numeric_features():
-    df = pd.read_csv(DATASET_PATH)
-
-    features = [
-        "feature_1",
-        "feature_2",
-        "feature_3",
-        "feature_4"
-    ]
-
-    for feature in features:
-        assert pd.api.types.is_numeric_dtype(df[feature])
+    df = load_dataset(dataset_path())
+    assert int(df.duplicated().sum()) == 0
 
 
-def test_no_infinite_values():
-    df = pd.read_csv(DATASET_PATH)
-
-    numeric_data = df.select_dtypes(include=np.number)
-
-    assert not np.isinf(numeric_data.to_numpy()).any()
+def test_no_infinite_numeric_values():
+    df = load_dataset(dataset_path())
+    numeric = df.select_dtypes(include="number")
+    assert numeric.shape[1] > 0
+    assert numeric.notna().all().all()

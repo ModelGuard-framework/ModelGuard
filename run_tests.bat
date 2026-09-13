@@ -1,0 +1,1 @@
+@echo off\nsetlocal\n\nREM Run all non-browser tests without activating a virtual environment.\npy -3.11 -m pytest -m "not ui" -q\nif errorlevel 1 pause\n
