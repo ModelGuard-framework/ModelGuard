@@ -8,10 +8,13 @@ import sys
 from html import escape as html_escape
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+import torch
 
 from core.config import DEFAULT_DATASET, DEFAULT_MODEL
+from core import validator as validator_module
 from core.validator import (
     find_label_column,
     get_feature_columns,
@@ -191,18 +194,123 @@ def read_dataset(path: Path) -> pd.DataFrame:
     return _read_csv_cached(str(path), path.stat().st_mtime)
 
 
+class TorchPredictAdapter:
+    """Small prediction adapter for complete serialized PyTorch modules.
+
+    The adapter is intentionally generic: it accepts tabular numeric inputs,
+    runs the PyTorch module on CPU, and converts logits/probabilities to
+    class predictions. DLRL-specific input shapes/preprocessing can be added
+    later once the real model contract is provided.
+    """
+
+    def __init__(self, module):
+        self.module = module.eval().cpu()
+
+    def predict(self, X):
+        if isinstance(X, pd.DataFrame):
+            try:
+                array = X.to_numpy(dtype=np.float32)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "PyTorch model requires numeric input columns. "
+                    "The supplied dataset contains non-numeric values."
+                ) from exc
+        else:
+            array = np.asarray(X, dtype=np.float32)
+
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
+
+        tensor = torch.as_tensor(array, dtype=torch.float32)
+
+        with torch.no_grad():
+            output = self.module(tensor)
+
+        if isinstance(output, dict):
+            for key in ("logits", "output", "predictions"):
+                if key in output:
+                    output = output[key]
+                    break
+            else:
+                output = next(iter(output.values()))
+
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+
+        if not torch.is_tensor(output):
+            output = torch.as_tensor(output)
+
+        if output.ndim == 0:
+            output = output.reshape(1)
+
+        if output.ndim == 2 and output.shape[1] > 1:
+            return torch.argmax(output, dim=1).cpu().numpy()
+
+        values = output.reshape(-1).detach().cpu().numpy()
+
+        if np.issubdtype(values.dtype, np.integer):
+            return values
+
+        return (values >= 0.5).astype(int)
+
+
 @st.cache_resource(show_spinner=False)
 def _load_model_cached(path_str: str, mtime: float):
-    return load_model(path_str)
+    return _load_any_model(Path(path_str))
+
+
+@st.cache_resource(show_spinner=False)
+def _load_pytorch_model_cached(path_str: str, mtime: float):
+    raw = torch.load(
+        path_str,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if isinstance(raw, torch.nn.Module):
+        return TorchPredictAdapter(raw)
+
+    if isinstance(raw, dict):
+        for key in ("model", "module"):
+            candidate = raw.get(key)
+            if isinstance(candidate, torch.nn.Module):
+                return TorchPredictAdapter(candidate)
+
+        if "state_dict" in raw or any(
+            isinstance(value, torch.Tensor) for value in raw.values()
+        ):
+            raise ValueError(
+                "This .pth/.pt file contains model weights/state_dict only. "
+                "The original PyTorch model architecture is required before "
+                "ModelGuard can construct the model and run inference."
+            )
+
+    raise ValueError(
+        "Unsupported PyTorch .pth/.pt format. Expected a complete torch.nn.Module "
+        "or a checkpoint containing a serialized model under 'model' or 'module'."
+    )
+
+
+def _load_any_model(path: Path):
+    if path.suffix.lower() in {".pth", ".pt"}:
+        return _load_pytorch_model_cached(
+            str(path),
+            path.stat().st_mtime_ns,
+        )
+    return load_model(path)
+
+
+# Give the core validation pipeline the same model loader.
+# Conventional models keep using the original loader; .pth/.pt models use
+# the PyTorch adapter above.
+validator_module.load_model = _load_any_model
 
 
 def read_model(path: Path):
     """
-    Cached model load. Avoids re-deserializing the joblib/pickle file on
-    every rerun (e.g. every sidebar click), same rationale as
-    read_dataset() above.
+    Cached model load for both conventional ML and complete PyTorch models.
     """
-    return _load_model_cached(str(path), path.stat().st_mtime)
+    return _load_model_cached(str(path), path.stat().st_mtime_ns)
 
 
 def load_last_results():
@@ -445,21 +553,70 @@ if page == "Dashboard":
 elif page == "Dataset":
     st.markdown('<div class="section-title">📁 Dataset Management</div>', unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("Upload test CSV dataset", type=["csv"], key="dataset_upload")
+    uploaded_files = st.file_uploader(
+        "Upload test CSV dataset(s)",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="dataset_upload",
+        help="Select one or more compatible CSV datasets at the same time.",
+    )
 
-    if uploaded is not None:
+    if uploaded_files:
         try:
-            path = save_uploaded_file(uploaded, UPLOAD_DIR)
-            df = read_dataset(path)
-            st.session_state.dataset_path = path
-            logger.info("Dataset uploaded: %s", path)
-            st.success(f"Dataset uploaded: {path.name}")
+            dataset_frames = []
+            dataset_names = []
+            expected_columns = None
+
+            for uploaded in uploaded_files:
+                path = save_uploaded_file(uploaded, UPLOAD_DIR / "datasets")
+                current_df = read_dataset(path)
+
+                if current_df.empty:
+                    raise ValueError(f"Dataset '{path.name}' is empty.")
+
+                if expected_columns is None:
+                    expected_columns = list(current_df.columns)
+                elif list(current_df.columns) != expected_columns:
+                    raise ValueError(
+                        f"Schema mismatch in '{path.name}'. "
+                        "All selected datasets must have the same columns "
+                        "in the same order."
+                    )
+
+                dataset_frames.append(current_df)
+                dataset_names.append(path.name)
+
+            df = pd.concat(dataset_frames, ignore_index=True)
+
+            combined_path = UPLOAD_DIR / "combined_test_dataset.csv"
+            df.to_csv(combined_path, index=False)
+
+            st.session_state.dataset_path = combined_path
+            st.session_state.dataset_files = dataset_names
+
+            logger.info(
+                "Multiple datasets uploaded: %s. Combined rows: %d",
+                ", ".join(dataset_names),
+                len(df),
+            )
+
+            st.success(
+                f"{len(dataset_names)} dataset(s) uploaded successfully "
+                f"and combined into {len(df)} rows."
+            )
+
+            st.write("Selected datasets:")
+            for name in dataset_names:
+                st.write(f"• {name}")
+
         except Exception as exc:
-            st.error(f"Could not read dataset: {exc}")
+            st.error(f"Could not process selected datasets: {exc}")
             df = None
+
     else:
         model_path, dataset_path = get_configured_paths()
         df = read_dataset(dataset_path) if dataset_path.exists() else None
+
         if df is not None:
             st.info(f"Using configured dataset: {dataset_path}")
 
@@ -471,13 +628,19 @@ elif page == "Dataset":
         c4.metric("Duplicate Rows", int(df.duplicated().sum()))
 
         st.markdown("### Dataset Preview")
-        st.dataframe(df.head(10), width='stretch')
+        st.dataframe(df.head(10), width="stretch")
 
         st.markdown("### Label Column")
         candidates = ["None"] + list(df.columns)
         current = st.session_state.get("label_column")
-        default_index = candidates.index(current) if current in candidates else (
-            candidates.index(find_label_column(df)) if find_label_column(df) in candidates else 0
+        default_index = (
+            candidates.index(current)
+            if current in candidates
+            else (
+                candidates.index(find_label_column(df))
+                if find_label_column(df) in candidates
+                else 0
+            )
         )
         selected = st.selectbox(
             "Select ground-truth label column (choose None if the dataset is unlabeled)",
@@ -504,20 +667,30 @@ elif page == "Dataset":
             "(mean/median/most-frequent/KNN neighbors) for Missing Value Handling below, "
             "instead of deriving fill values from the dataset being validated itself."
         )
+
         reference_upload = st.file_uploader(
             "Upload training/reference CSV dataset",
             type=["csv"],
             key="reference_dataset_upload",
         )
+
         if reference_upload is not None:
             try:
-                ref_path = save_uploaded_file(reference_upload, UPLOAD_DIR / "reference")
+                ref_path = save_uploaded_file(
+                    reference_upload,
+                    UPLOAD_DIR / "reference",
+                )
                 st.session_state.reference_dataset_path = ref_path
-                st.success(f"Training/reference dataset uploaded: {ref_path.name}")
+                st.success(
+                    f"Training/reference dataset uploaded: {ref_path.name}"
+                )
             except Exception as exc:
                 st.error(f"Could not read training/reference dataset: {exc}")
         elif st.session_state.get("reference_dataset_path"):
-            st.info(f"Using training/reference dataset: {st.session_state.reference_dataset_path}")
+            st.info(
+                f"Using training/reference dataset: "
+                f"{st.session_state.reference_dataset_path}"
+            )
             if st.button("Clear training/reference dataset"):
                 del st.session_state["reference_dataset_path"]
 
@@ -527,6 +700,7 @@ elif page == "Dataset":
             value=st.session_state.get("allow_imputation", True),
             key="allow_imputation",
         )
+
         if allow_imputation:
             st.selectbox(
                 "Imputation strategy",
@@ -535,9 +709,12 @@ elif page == "Dataset":
                     st.session_state.get("impute_strategy", "mean")
                 ),
                 key="impute_strategy",
-                help="mean/median/most_frequent use per-column statistics; "
-                "knn imputes each missing value from its 5 nearest complete rows.",
+                help=(
+                    "mean/median/most_frequent use per-column statistics; "
+                    "knn imputes each missing value from its 5 nearest complete rows."
+                ),
             )
+
             if st.session_state.get("reference_dataset_path"):
                 st.caption(
                     "A training/reference dataset is set above, so imputation will use its "
@@ -555,12 +732,23 @@ elif page == "Dataset":
 # MODEL
 # ==================================================
 elif page == "Model":
-    st.markdown('<div class="section-title">🤖 Model Management</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title">🤖 Model Management</div>',
+        unsafe_allow_html=True,
+    )
 
     uploaded = st.file_uploader(
-        "Upload ML model (.joblib, .pkl or .pickle)",
-        type=["joblib", "pkl", "pickle"],
+        "Upload ML model",
+        type=["joblib", "pkl", "pickle", "pth", "pt"],
         key="model_upload",
+        help=(
+            "Supported: conventional joblib/pickle models and complete "
+            "PyTorch .pth/.pt modules."
+        ),
+    )
+    st.caption(
+        "Large-file uploads are supported through Streamlit server.maxUploadSize. "
+        "The project configuration sets the per-file limit to 2 GB."
     )
 
     if uploaded is not None:
@@ -573,11 +761,15 @@ elif page == "Model":
 
             st.write(f"Model type: `{type(model).__name__}`")
             st.write(f"Has predict(): `{hasattr(model, 'predict')}`")
+            st.write(f"Has forward(): `{hasattr(model, 'module') or hasattr(model, 'forward')}`")
+
             feature_names = getattr(model, "feature_names_in_", None)
             if feature_names is not None:
                 st.write("Expected features:", list(feature_names))
+
         except Exception as exc:
             st.error(f"Model could not be loaded: {exc}")
+
     else:
         model_path, _ = get_configured_paths()
         if model_path.exists():
@@ -650,19 +842,22 @@ elif page == "Validation":
             env["MODEL_PATH"] = str(model_path.resolve())
             env["DATASET_PATH"] = str(dataset_path.resolve())
             env["PYTHONPATH"] = str(ROOT)
-            # Offline-only Selenium: never ask Selenium Manager to download a driver.
-            # Resolution order: explicit env var -> project drivers/ folder -> fixed
-            # local install path used on this machine.
-            _project_driver = ROOT / "drivers" / "chromedriver.exe"
-            _fixed_driver = Path(r"C:\WebDriver\chromedriver.exe")
+
+            # Keep the existing ChromeDriver configuration for now.
+            project_driver = ROOT / "drivers" / "chromedriver.exe"
+            fixed_driver = Path(r"C:\WebDriver\chromedriver.exe")
+
             if os.environ.get("CHROMEDRIVER_PATH"):
                 local_driver = os.environ["CHROMEDRIVER_PATH"]
-            elif _project_driver.is_file():
-                local_driver = str(_project_driver)
+            elif project_driver.is_file():
+                local_driver = str(project_driver)
             else:
-                local_driver = str(_fixed_driver)
+                local_driver = str(fixed_driver)
+
             env["CHROMEDRIVER_PATH"] = local_driver
+
             logger.info("Starting Selenium UI validation.")
+
             try:
                 completed = subprocess.run(
                     [sys.executable, "-m", "pytest", "-m", "ui", "-q"],
@@ -672,16 +867,26 @@ elif page == "Validation":
                     text=True,
                     timeout=180,
                 )
-                st.session_state.selenium_last_output = completed.stdout + "\n" + completed.stderr
-                st.session_state.selenium_last_passed = completed.returncode == 0
+
+                st.session_state.selenium_last_output = (
+                    completed.stdout + "\n" + completed.stderr
+                )
+                st.session_state.selenium_last_passed = (
+                    completed.returncode == 0
+                )
+
                 if completed.returncode == 0:
                     logger.info("Selenium UI validation passed.")
                 else:
                     logger.error("Selenium UI validation failed.")
+
             except Exception as exc:
                 logger.exception("Selenium validation could not start.")
-                st.session_state.selenium_last_output = f"Could not run Selenium validation: {exc}"
+                st.session_state.selenium_last_output = (
+                    f"Could not run Selenium validation: {exc}"
+                )
                 st.session_state.selenium_last_passed = False
+
 
         def _run_full_validation():
             logger.info("Validation started. Model=%s Dataset=%s", model_path, dataset_path)

@@ -7,3 +7,4 @@ pytest
 streamlit
 selenium
 python-docx
+torch
